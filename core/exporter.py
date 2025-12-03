@@ -101,6 +101,6 @@ def save_report_bundle(out_dir: Path, tables: Dict[str, pd.DataFrame], excel_byt
     # Exemples d’exports CSV légers (modifiable à volonté)
     for name in ["actions_latest", "equipment_downtime", "transitions"]:
         if name in tables:
-            tables[name].to_csv(out_dir / f"{name}.csv", index=False, encoding="utf-8")
+            tables[name].to_csv(out_dir / f"{name}.csv", index=False, encoding="utf-8", sep=";")
 
     return excel_path
