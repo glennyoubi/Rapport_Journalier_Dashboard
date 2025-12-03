@@ -1,0 +1,7 @@
+streamlit>=1.29
+pandas>=2.0
+numpy>=1.24
+plotly>=5.15
+xlsxwriter>=3.1
+pyarrow>=14.0  # optionnel pour l'export Parquet
+pytest>=7.4
