@@ -1,7 +1,9 @@
 # app.py
 import io
+import json
+import zipfile
 import datetime as dt
-from pathlib import Path
+from collections import OrderedDict
 
 import pandas as pd
 import streamlit as st
@@ -10,12 +12,11 @@ from core.processing import (
     excel_sheet_names_from_bytes,
     sha1_bytes,
 )
-from core.exporter import export_tables_to_excel_bytes, save_report_bundle
+from core.exporter import export_tables_to_excel_bytes
 from core.filters import (
     normalize_date_filters,
     filter_tables_by_dates,
     recount,
-    date_bounds_from_tables,
 )
 from core.charts import (
     time_status_counts,
@@ -37,7 +38,6 @@ def ensure_ss():
     SS.setdefault("file_bytes", None)
     SS.setdefault("start_sheet", 1)
     SS.setdefault("end_sheet_opt", "")
-    SS.setdefault("auto_update", False)
     SS.setdefault("analyst_mode", False)
 
     SS.setdefault("tables_full", None)
@@ -50,7 +50,8 @@ def ensure_ss():
     SS.setdefault("filter_metier", [])
     SS.setdefault("filter_zone", [])
     SS.setdefault("filter_plateforme", [])
-    SS.setdefault("filter_tag_text", "")
+    SS.setdefault("filter_tag_select", "(Tous)")
+    SS.setdefault("filter_tag_pattern", "")
     SS.setdefault("filter_text", "")
 
     SS.setdefault("last_run_file_hash", None)
@@ -63,29 +64,36 @@ def ensure_ss():
 
 SS = ensure_ss()
 
+# ---------------- Header ----------------
+st.title("📈 Résumé Hebdomadaire")
+msg = st.empty()
+
+# Noms d'affichage pour les tables (onglets + Excel)
+TABLE_DISPLAY_NAMES = {
+    "running_actions": "Actions en cours",
+    "ended_actions": "Actions terminées",
+    "postponed_actions": "Actions reportées",
+    "equipment_downtime": "Indisponibilités équipements",
+    "actions_latest": "Statut des actions (statut à la date de fin)",
+    "actions_consistent": "Actions (historique consolidé)",
+    "transitions": "Transitions de statut",
+    "actions_daily": "Actions (journalier brut)",
+}
+
 # ---------------- Sidebar ----------------
 with st.sidebar:
-    st.header("⚙️ Paramètres")
+    st.header(" Paramètres")
     up = st.file_uploader("Charger le fichier hebdo (.xlsx)", type=["xlsx"], key="uploader")
     if up is not None:
         SS.file_bytes = up.getvalue()
 
     SS.start_sheet = st.number_input("Feuille de début (1-based)", min_value=1, value=int(SS.start_sheet), step=1)
     SS.end_sheet_opt = st.text_input("Feuille de fin (vide = dernière)", value=SS.end_sheet_opt)
-    st.toggle("Mise à jour auto (si feuilles changent)", value=SS.auto_update, key="auto_update")
     SS.analyst_mode = st.toggle("Mode analyste (tables avancées)", value=SS.analyst_mode)
 
     st.markdown("---")
-    run_btn = st.button("🚀 Lancer / Mettre à jour", type="primary")
+    run_btn = st.button(" Lancer / Mettre à jour", type="primary")
     st.markdown("---")
-    if st.button("🧹 Vider les caches"):
-        st.cache_data.clear()
-        st.toast("Caches vidés")
-        st.rerun()
-
-# ---------------- Header ----------------
-st.title("📈 Résumé Hebdomadaire")
-msg = st.empty()
 
 
 # ---------------- Utils ----------------
@@ -107,7 +115,7 @@ def needs_update(file_bytes: bytes | None, start_sheet: int, end_sheet: int) -> 
 
 def resolve_range_or_warn():
     if SS.file_bytes is None:
-        msg.warning("Merci d’uploader un fichier Excel.")
+        msg.warning("Merci duploader un fichier Excel.")
         return None
     try:
         if not SS.end_sheet_opt:
@@ -121,7 +129,7 @@ def resolve_range_or_warn():
             st.error(f"Plage invalide : le fichier contient {total_sheets} feuilles.")
             return None
         if end_sheet < start_sheet:
-            st.error("La feuille de fin doit être ≥ la feuille de début.")
+            st.error("La feuille de fin doit être  la feuille de début.")
             return None
         return start_sheet, end_sheet
     except ValueError:
@@ -138,7 +146,7 @@ def warn_if_missing_dates(tables: dict):
         st.warning(
             f"{missing} lignes sans date détectées (colonne date_rapport). "
             "Elles sont ignorées dans les filtres/graphes. Vérifiez les fichiers sources.",
-            icon="⚠️",
+            icon="",
         )
 
 
@@ -153,33 +161,19 @@ def run_pipeline_excel_only(file_bytes: bytes, start_sheet: int, end_sheet: int)
     SS.counts_view = recount(SS.tables_view)
 
 
-# ---------------- Run / Auto-update ----------------
+# ---------------- Run ----------------
 if run_btn:
     SS.last_error = None
     rng = resolve_range_or_warn()
     if rng:
         s, e = rng
         try:
-            with st.spinner("Traitement en cours…"):
+            with st.spinner("Traitement en cours"):
                 run_pipeline_excel_only(SS.file_bytes, s, e)
             msg.success("Analyse mise à jour ✅")
         except Exception as ex:
             SS.last_error = str(ex)
             st.exception(ex)
-else:
-    if SS.auto_update and SS.file_bytes is not None:
-        rng = resolve_range_or_warn()
-        if rng:
-            s, e = rng
-            if needs_update(SS.file_bytes, s, e):
-                SS.last_error = None
-                try:
-                    with st.spinner("Mise à jour auto…"):
-                        run_pipeline_excel_only(SS.file_bytes, s, e)
-                    st.toast("Auto-mise à jour effectuée")
-                except Exception as ex:
-                    SS.last_error = str(ex)
-                    st.exception(ex)
 
 # ---------------- Render ----------------
 if SS.last_error:
@@ -193,7 +187,7 @@ if SS.tables_full:
             st.warning(
                 "Les paramètres de feuilles ont changé depuis la dernière exécution. "
                 "Cliquez **Lancer / Mettre à jour**.",
-                icon="⚠️",
+                icon="",
             )
 
     warn_if_missing_dates(SS.tables_full)
@@ -201,32 +195,34 @@ if SS.tables_full:
     # ====== Filtres ======
     st.subheader("🎛️ Filtres")
     lo, hi, fmin, fmax = normalize_date_filters(SS, SS.tables_full)
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
-
-    with c1:
-        new_min = st.date_input("Date début", value=fmin, min_value=lo, max_value=hi, format="YYYY-MM-DD")
-    with c2:
-        new_max = st.date_input("Date fin", value=fmax, min_value=lo, max_value=hi, format="YYYY-MM-DD")
 
     ac = SS.tables_full["actions_consistent"]
     metiers_all = sorted([x for x in ac["metier"].dropna().unique() if x])
     zones_all = sorted([x for x in ac["champ_zone"].dropna().unique() if x])
     plats_all = sorted([x for x in ac["plateforme_sous_zone"].dropna().unique() if x])
+    tags_all = sorted([x for x in ac["tag_equipement"].dropna().unique() if str(x).strip()])
 
-    with c3:
+    row1 = st.columns([1, 1, 1, 1])
+    with row1[0]:
+        new_min = st.date_input("Date début", value=fmin, min_value=lo, max_value=hi, format="YYYY-MM-DD")
+    with row1[1]:
+        new_max = st.date_input("Date fin", value=fmax, min_value=lo, max_value=hi, format="YYYY-MM-DD")
+    with row1[2]:
         SS.filter_metier = st.multiselect("Métier", metiers_all, default=SS.filter_metier)
-    with c4:
+    with row1[3]:
         SS.filter_zone = st.multiselect("Champ / Zone", zones_all, default=SS.filter_zone)
-    with c5:
-        SS.filter_plateforme = st.multiselect("Plateforme / Sous-zone", plats_all, default=SS.filter_plateforme)
 
-    c6, c7, c8 = st.columns([2, 2, 1])
-    with c6:
-        SS.filter_tag_text = st.text_input("Filtre TAG (contient…)", value=SS.filter_tag_text, placeholder="ex: P-")
-    with c7:
-        SS.filter_text = st.text_input("Filtre texte (travaux/commentaires)", value=SS.filter_text, placeholder="mots clés")
-    with c8:
-        apply_filters = st.button("Appliquer filtres", use_container_width=True)
+    row2 = st.columns([1, 1, 1, 1])
+    with row2[0]:
+        SS.filter_plateforme = st.multiselect("Plateforme / Sous-zone", plats_all, default=SS.filter_plateforme)
+    with row2[1]:
+        SS.filter_tag_select = st.selectbox("TAG (sélection unique)", options=["(Tous)"] + tags_all, index=0)
+    with row2[2]:
+        SS.filter_tag_pattern = st.text_input("TAG (contient)", value=SS.filter_tag_pattern, placeholder="ex: P-")
+    with row2[3]:
+        SS.filter_text = st.text_input("Texte (travaux/commentaires)", value=SS.filter_text, placeholder="mots clés")
+
+    apply_filters = st.button("Appliquer filtres", use_container_width=True)
 
     if apply_filters:
         from core.filters import clamp_date
@@ -247,14 +243,14 @@ if SS.tables_full:
                 out = out[out["champ_zone"].isin(SS.filter_zone)]
             if SS.filter_plateforme:
                 out = out[out["plateforme_sous_zone"].isin(SS.filter_plateforme)]
-            if SS.filter_tag_text:
-                out = out[out["tag_equipement"].astype(str).str.contains(SS.filter_tag_text, case=False, na=False)]
+            if SS.filter_tag_select and SS.filter_tag_select != "(Tous)":
+                out = out[out["tag_equipement"].astype(str) == SS.filter_tag_select]
+            if SS.filter_tag_pattern:
+                out = out[out["tag_equipement"].astype(str).str.contains(SS.filter_tag_pattern, case=False, na=False)]
             if SS.filter_text:
                 txt = SS.filter_text.lower()
                 out = out[out["travaux_commentaires"].astype(str).str.lower().str.contains(txt, na=False)]
             return out
-
-            # End def
 
         SS.tables_view = {
             name: apply_entity_filters(df) if "travaux_commentaires" in df.columns else df
@@ -264,7 +260,7 @@ if SS.tables_full:
         st.toast("Filtres appliqués")
 
     # ====== KPIs ======
-    st.subheader("📊 Indicateurs (après filtres)")
+    st.subheader("📊 Indicateurs")
     tv = SS.tables_view or SS.tables_full
     latest = tv.get("actions_latest")
     if latest is not None and not latest.empty:
@@ -374,18 +370,25 @@ if SS.tables_full:
         with c2:
             if not tag_count.empty:
                 top3 = tag_count.head(3)
-                st.write("Équipements à risque (top 3)")
+                st.write("quipements à risque (top 3)")
                 st.dataframe(top3, use_container_width=True, hide_index=True)
             else:
                 st.caption("Pas de TAG à risque.")
+    else:
+        st.caption("Pas de données disponibles pour les risques.")
 
     st.subheader("💾 Export & Sauvegarde")
-    col_dl1, col_dl2 = st.columns([1, 2])
-    with col_dl1:
+    exp_col1, exp_col2 = st.columns(2)
+
+    with exp_col1:
+        st.markdown("**Excel consolidé**")
         try:
-            excel_bytes = export_tables_to_excel_bytes(tv)
+            excel_tables_named = OrderedDict(
+                (TABLE_DISPLAY_NAMES.get(k, k), v) for k, v in tv.items()
+            )
+            excel_bytes = export_tables_to_excel_bytes(excel_tables_named)
             st.download_button(
-                "Télécharger Excel consolidé (filtres appliqués)",
+                "Télécharger (filtres appliqués)",
                 data=excel_bytes,
                 file_name="Rapport_Hebdo_Resume.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -394,12 +397,16 @@ if SS.tables_full:
         except Exception as ex:
             st.error(f"Export Excel échoué : {ex}")
 
-    with col_dl2:
-        st.info("💡 Sauvegarde automatique : un dossier est créé à chaque exécution **Lancer / Mettre à jour**.")
-        if st.button("Forcer une sauvegarde maintenant"):
+    with exp_col2:
+        st.markdown("💡 Bundle ZIP (Excel complet + manifest + CSV clés)")
+        if SS.tables_full:
             ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = Path(SS.reports_dir) / ts
-            excel_bytes_all = export_tables_to_excel_bytes(SS.tables_full)
+
+            excel_full_named = OrderedDict(
+                (TABLE_DISPLAY_NAMES.get(k, k), v) for k, v in SS.tables_full.items()
+            )
+            excel_bytes_all = export_tables_to_excel_bytes(excel_full_named)
+
             meta = {
                 "start_sheet": SS.last_run_start_sheet,
                 "end_sheet": SS.last_run_end_sheet,
@@ -411,12 +418,39 @@ if SS.tables_full:
                     "metier": SS.filter_metier,
                     "zone": SS.filter_zone,
                     "plateforme": SS.filter_plateforme,
-                    "tag_like": SS.filter_tag_text,
+                    "tag_select": SS.filter_tag_select,
+                    "tag_pattern": SS.filter_tag_pattern,
                     "text_like": SS.filter_text,
                 },
             }
-            saved = save_report_bundle(out_dir, SS.tables_full, excel_bytes_all, meta)
-            st.success(f"Sauvegarde effectuée dans : {saved.parent}")
+
+            bundle_buf = io.BytesIO()
+            manifest = {
+                "meta": meta,
+                "counts": {k: len(v) for k, v in SS.tables_full.items()},
+            }
+
+            with zipfile.ZipFile(bundle_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("Rapport_Hebdo_Resume.xlsx", excel_bytes_all)
+                zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                for name in ["actions_latest", "equipment_downtime", "transitions"]:
+                    if name in SS.tables_full:
+                        csv_buf = io.StringIO()
+                        SS.tables_full[name].to_csv(csv_buf, index=False, sep=";")
+                        zf.writestr(f"{name}.csv", csv_buf.getvalue())
+
+            bundle_buf.seek(0)
+
+            st.download_button(
+                "📦 Télécharger le bundle (ZIP)",
+                data=bundle_buf.getvalue(),
+                file_name=f"rapport_bundle_{ts}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+            st.caption("Généré en mémoire : aucune sauvegarde côté serveur.")
+        else:
+            st.caption("Le bundle complet sera disponible après la première exécution du traitement.")
 
     st.divider()
 
@@ -438,17 +472,6 @@ if SS.tables_full:
 
     tabs = st.tabs([label for _, label in table_entries])
 
-    descriptions = {
-        "actions_daily": "Données brutes par jour telles que lues dans les feuilles.",
-        "actions_consistent": "Historique consolidé des statuts (cohérent dans le temps).",
-        "actions_latest": "Photo actuelle de chaque action au dernier jour.",
-        "ended_actions": "Actions terminées.",
-        "running_actions": "Actions en cours (non terminées).",
-        "postponed_actions": "Actions reportées (non terminées).",
-        "equipment_downtime": "Périodes d'indisponibilité des équipements.",
-        "transitions": "Historique des changements de statut.",
-    }
-
     for tab_obj, (name, label) in zip(tabs, table_entries):
         with tab_obj:
             if name not in tv:
@@ -456,44 +479,27 @@ if SS.tables_full:
                 continue
 
             df = tv[name]
-
-            st.write(f"**{label}** — {len(df):,} lignes".replace(",", " "))
+            st.write(f"**{label}**  {len(df):,} lignes".replace(",", " "))
             df_view = df.drop(columns=["action_key"], errors="ignore")
             st.dataframe(df_view, use_container_width=True, height=420, hide_index=True)
 
-            cdl1, cdl2 = st.columns(2)
-            with cdl1:
-                st.download_button(
-                    "CSV",
-                    data=df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{name}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            with cdl2:
-                try:
-                    import pyarrow  # noqa: F401
-                    buf = io.BytesIO()
-                    df.to_parquet(buf, index=False)
-                    st.download_button(
-                        "Parquet",
-                        data=buf.getvalue(),
-                        file_name=f"{name}.parquet",
-                        mime="application/octet-stream",
-                        use_container_width=True,
-                    )
-                except Exception:
-                    st.caption("Installez `pyarrow` pour activer le téléchargement Parquet.")
+            st.download_button(
+                "CSV",
+                data=df.to_csv(index=False, sep=";").encode("utf-8"),
+                file_name=f"{name}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     st.caption(
         "Chaque action possède une clé unique `action_key` (masquée ici) pour la suivre dans le temps. "
         "Tables : "
-        "• Actions en cours / terminées / reportées = état actuel par sous-ensemble ; "
-        "• Statut des actions (statut à la date de fin) = snapshot complet au dernier jour (1 ligne par action) ; "
-        "• Indisponibilités équipements = périodes où les équipements sont marqués indisponibles ; "
-        "• (Mode analyste) Historique consolidé = statuts cohérents jour par jour ; Transitions = changements de statut. "
-        "Les exports CSV/Parquet conservent `action_key` pour vos croisements."
+        " Actions en cours / terminées / reportées = état actuel par sous-ensemble ; "
+        " Statut des actions (statut à la date de fin) = snapshot complet au dernier jour (1 ligne par action) ; "
+        " Indisponibilités équipements = périodes où les équipements sont marqués indisponibles ; "
+        " (Mode analyste) Historique consolidé = statuts cohérents jour par jour ; Transitions = changements de statut. "
+        "Les exports CSV conservent `action_key` pour vos croisements."
     )
 
 else:
-    st.info("⬆️ Uploade un fichier, choisis la plage de feuilles, puis clique **Lancer / Mettre à jour**.")
+    st.info(" Uploade un fichier, choisis la plage de feuilles, puis clique **Lancer / Mettre à jour**.")
