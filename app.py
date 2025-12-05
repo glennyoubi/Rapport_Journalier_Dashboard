@@ -36,6 +36,7 @@ st.set_page_config(page_title="Résumé des rapports journaliers", layout="wide"
 def ensure_ss():
     SS = st.session_state
     SS.setdefault("file_bytes", None)
+    SS.setdefault("uploaded_hash", None)
     SS.setdefault("start_sheet", 1)
     SS.setdefault("end_sheet_opt", "")
     SS.setdefault("analyst_mode", False)
@@ -50,7 +51,7 @@ def ensure_ss():
     SS.setdefault("filter_metier", [])
     SS.setdefault("filter_zone", [])
     SS.setdefault("filter_plateforme", [])
-    SS.setdefault("filter_tag_select", "(Tous)")
+    SS.setdefault("filter_tag_select", [])
     SS.setdefault("filter_tag_pattern", "")
     SS.setdefault("filter_text", "")
 
@@ -85,7 +86,19 @@ with st.sidebar:
     st.header(" Paramètres")
     up = st.file_uploader("Charger le fichier hebdo (.xlsx)", type=["xlsx"], key="uploader")
     if up is not None:
-        SS.file_bytes = up.getvalue()
+        new_bytes = up.getvalue()
+        new_hash = sha1_bytes(new_bytes)
+        if new_hash != SS.uploaded_hash:
+            # Nouveau fichier charge : on remet l'etat a plat pour eviter les erreurs transitoires
+            st.cache_data.clear()
+            SS.uploaded_hash = new_hash
+            SS.tables_full = None
+            SS.tables_view = None
+            SS.counts_view = None
+            SS.last_error = None
+            SS.filter_dmin = None
+            SS.filter_dmax = None
+        SS.file_bytes = new_bytes
 
     SS.start_sheet = st.number_input("Feuille de début (1-based)", min_value=1, value=int(SS.start_sheet), step=1)
     SS.end_sheet_opt = st.text_input("Feuille de fin (vide = dernière)", value=SS.end_sheet_opt)
@@ -216,7 +229,7 @@ if SS.tables_full:
     with row2[0]:
         SS.filter_plateforme = st.multiselect("Plateforme / Sous-zone", plats_all, default=SS.filter_plateforme)
     with row2[1]:
-        SS.filter_tag_select = st.selectbox("TAG (sélection unique)", options=["(Tous)"] + tags_all, index=0)
+        SS.filter_tag_select = st.multiselect("TAG (choix multiples)", options=tags_all, default=SS.filter_tag_select)
     with row2[2]:
         SS.filter_tag_pattern = st.text_input("TAG (contient)", value=SS.filter_tag_pattern, placeholder="ex: P-")
     with row2[3]:
@@ -243,8 +256,8 @@ if SS.tables_full:
                 out = out[out["champ_zone"].isin(SS.filter_zone)]
             if SS.filter_plateforme:
                 out = out[out["plateforme_sous_zone"].isin(SS.filter_plateforme)]
-            if SS.filter_tag_select and SS.filter_tag_select != "(Tous)":
-                out = out[out["tag_equipement"].astype(str) == SS.filter_tag_select]
+            if SS.filter_tag_select:
+                out = out[out["tag_equipement"].astype(str).isin(SS.filter_tag_select)]
             if SS.filter_tag_pattern:
                 out = out[out["tag_equipement"].astype(str).str.contains(SS.filter_tag_pattern, case=False, na=False)]
             if SS.filter_text:
